@@ -1,82 +1,200 @@
-const express=require("express");
-const body_parser=require("body-parser");
-const axios=require("axios");
-require('dotenv').config();
+const express = require("express");
+const body_parser = require("body-parser");
+const axios = require("axios");
+const crypto = require("crypto");
+require("dotenv").config();
 
-const app=express().use(body_parser.json());
+const app = express().use(body_parser.json());
 
-const token=process.env.TOKEN;
-const mytoken=process.env.MYTOKEN;//prasath_token
+// Env vars
+const token = process.env.TOKEN;        // WhatsApp access token
+const mytoken = process.env.MYTOKEN;    // webhook verify token
+const PRIVATE_KEY = process.env.PRIVATE_KEY; // RSA private key for Flows
 
-app.listen(process.env.PORT,()=>{
-    console.log("webhook is listening");
+// 1) WEBHOOK VERIFICATION (GET /webhook)
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const challenge = req.query["hub.challenge"];
+  const verifyToken = req.query["hub.verify_token"];
+
+  if (mode && verifyToken) {
+    if (mode === "subscribe" && verifyToken === mytoken) {
+      console.log("✅ Webhook verified");
+      return res.status(200).send(challenge);
+    } else {
+      console.log("❌ Webhook verification failed");
+      return res.sendStatus(403);
+    }
+  } else {
+    return res.sendStatus(400);
+  }
 });
 
-//to verify the callback url from dashboard side - cloud api side
-app.get("/webhook",(req,res)=>{
-   let mode=req.query["hub.mode"];
-   let challange=req.query["hub.challenge"];
-   let token=req.query["hub.verify_token"];
+// 2) WEBHOOK EVENTS (POST /webhook) – your old logic kept
+app.post("/webhook", async (req, res) => {
+  const body_param = req.body;
 
+  console.log("📩 Incoming webhook:\n", JSON.stringify(body_param, null, 2));
 
-    if(mode && token){
+  if (
+    body_param.object &&
+    body_param.entry &&
+    body_param.entry[0].changes &&
+    body_param.entry[0].changes[0].value.messages &&
+    body_param.entry[0].changes[0].value.messages[0]
+  ) {
+    try {
+      const value = body_param.entry[0].changes[0].value;
+      const phon_no_id = value.metadata.phone_number_id;
+      const from = value.messages[0].from;
+      const msg_body = value.messages[0].text?.body || "";
 
-        if(mode==="subscribe" && token===mytoken){
-            res.status(200).send(challange);
-        }else{
-            res.status(403);
-        }
+      console.log("phone number:", phon_no_id);
+      console.log("from:", from);
+      console.log("body:", msg_body);
 
+      await axios({
+        method: "POST",
+        url:
+          "https://graph.facebook.com/v13.0/" +
+          phon_no_id +
+          "/messages?access_token=" +
+          token,
+        data: {
+          messaging_product: "whatsapp",
+          to: from,
+          text: {
+            body: "Hi.. I'm Prasath, your message is " + msg_body,
+          },
+        },
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      return res.sendStatus(200);
+    } catch (err) {
+      console.error("Error sending reply:", err.response?.data || err.message);
+      return res.sendStatus(500);
+    }
+  } else {
+    return res.sendStatus(404);
+  }
+});
+
+// 3) FLOW DATA ENDPOINT (POST /data) – encrypted channel for Flows
+app.post("/data", (req, res) => {
+  try {
+    if (!PRIVATE_KEY) {
+      console.error("❌ PRIVATE_KEY env var is missing");
+      return res.sendStatus(500);
     }
 
-});
+    // Decrypt request
+    const { decryptedBody, aesKeyBuffer, initialVectorBuffer } = decryptRequest(
+      req.body,
+      PRIVATE_KEY
+    );
 
-app.post("/webhook",(req,res)=>{ //i want some 
+    console.log("🧩 Decrypted Flow payload:", decryptedBody);
 
-    let body_param=req.body;
+    let responsePayload;
 
-    console.log(JSON.stringify(body_param,null,2));
-
-    if(body_param.object){
-        console.log("inside body param");
-        if(body_param.entry && 
-            body_param.entry[0].changes && 
-            body_param.entry[0].changes[0].value.messages && 
-            body_param.entry[0].changes[0].value.messages[0]  
-            ){
-               let phon_no_id=body_param.entry[0].changes[0].value.metadata.phone_number_id;
-               let from = body_param.entry[0].changes[0].value.messages[0].from; 
-               let msg_body = body_param.entry[0].changes[0].value.messages[0].text.body;
-
-               console.log("phone number "+phon_no_id);
-               console.log("from "+from);
-               console.log("boady param "+msg_body);
-
-               axios({
-                   method:"POST",
-                   url:"https://graph.facebook.com/v13.0/"+phon_no_id+"/messages?access_token="+token,
-                   data:{
-                       messaging_product:"whatsapp",
-                       to:from,
-                       text:{
-                           body:"Hi.. I'm Prasath, your message is "+msg_body
-                       }
-                   },
-                   headers:{
-                       "Content-Type":"application/json"
-                   }
-
-               });
-
-               res.sendStatus(200);
-            }else{
-                res.sendStatus(404);
-            }
-
+    // Health check from Meta
+    if (decryptedBody.action === "ping") {
+      responsePayload = {
+        data: {
+          status: "active",
+        },
+      };
+    } else {
+      // Normal data_exchange / INIT / BACK
+      responsePayload = {
+        screen: "SCREEN_NAME", // TODO: replace with your real screen name
+        data: {
+          some_key: "some_value",
+        },
+      };
     }
 
+    // Encrypt response and send as Base64 plain text
+    const encrypted = encryptResponse(
+      responsePayload,
+      aesKeyBuffer,
+      initialVectorBuffer
+    );
+    res.type("text/plain").send(encrypted);
+  } catch (err) {
+    console.error("❌ Error in /data:", err);
+    // 421 tells the client to re-download the public key and retry
+    res.sendStatus(421);
+  }
 });
 
-app.get("/",(req,res)=>{
-    res.status(200).send("hello this is webhook setup");
+// 4) Simple root route
+app.get("/", (req, res) => {
+  res.status(200).send("hello this is webhook setup");
+});
+
+// ---------- Helpers for Flow encryption ----------
+
+function decryptRequest(body, privatePem) {
+  const { encrypted_aes_key, encrypted_flow_data, initial_vector } = body;
+
+  const decryptedAesKey = crypto.privateDecrypt(
+    {
+      key: crypto.createPrivateKey(privatePem),
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    Buffer.from(encrypted_aes_key, "base64")
+  );
+
+  const flowDataBuffer = Buffer.from(encrypted_flow_data, "base64");
+  const ivBuffer = Buffer.from(initial_vector, "base64");
+
+  const TAG_LENGTH = 16;
+  const encryptedBody = flowDataBuffer.subarray(0, -TAG_LENGTH);
+  const authTag = flowDataBuffer.subarray(-TAG_LENGTH);
+
+  const decipher = crypto.createDecipheriv(
+    "aes-128-gcm",
+    decryptedAesKey,
+    ivBuffer
+  );
+  decipher.setAuthTag(authTag);
+
+  const clearJson = Buffer.concat([
+    decipher.update(encryptedBody),
+    decipher.final(),
+  ]).toString("utf-8");
+
+  return {
+    decryptedBody: JSON.parse(clearJson),
+    aesKeyBuffer: decryptedAesKey,
+    initialVectorBuffer: ivBuffer,
+  };
+}
+
+function encryptResponse(responseObj, aesKeyBuffer, initialVectorBuffer) {
+  // Flip IV bits as required by Meta docs
+  const flippedIV = Buffer.alloc(initialVectorBuffer.length);
+  for (let i = 0; i < initialVectorBuffer.length; i++) {
+    flippedIV[i] = initialVectorBuffer[i] ^ 0xff;
+  }
+
+  const cipher = crypto.createCipheriv("aes-128-gcm", aesKeyBuffer, flippedIV);
+  const encrypted = Buffer.concat([
+    cipher.update(JSON.stringify(responseObj), "utf-8"),
+    cipher.final(),
+  ]);
+  const tag = cipher.getAuthTag();
+  const withTag = Buffer.concat([encrypted, tag]);
+  return withTag.toString("base64");
+}
+
+// 5) Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log("webhook is listening on port", PORT);
 });
