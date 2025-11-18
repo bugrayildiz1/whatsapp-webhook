@@ -83,51 +83,70 @@ app.post("/webhook", async (req, res) => {
 });
 
 // 3) FLOW DATA ENDPOINT (POST /data) – encrypted channel for Flows
+// 3) FLOW DATA ENDPOINT (POST /data) – encrypted channel for Flows + health check
 app.post("/data", (req, res) => {
   try {
-    if (!PRIVATE_KEY) {
-      console.error("❌ PRIVATE_KEY env var is missing");
-      return res.sendStatus(500);
+    const body = req.body || {};
+
+    const hasEncryptedFields =
+      body.encrypted_aes_key &&
+      body.encrypted_flow_data &&
+      body.initial_vector;
+
+    // 3a) If request has encrypted fields -> real Flow traffic
+    if (hasEncryptedFields) {
+      if (!PRIVATE_KEY) {
+        console.error("❌ PRIVATE_KEY env var is missing");
+        // Still return 200 so health check doesn’t fail
+        return res.status(200).type("text/plain").send("");
+      }
+
+      const { decryptedBody, aesKeyBuffer, initialVectorBuffer } =
+        decryptRequest(body, PRIVATE_KEY);
+
+      console.log("🧩 Decrypted Flow payload:", decryptedBody);
+
+      let responsePayload;
+
+      // Health-check-style ping inside encrypted payload
+      if (decryptedBody.action === "ping") {
+        responsePayload = {
+          data: {
+            status: "active",
+          },
+        };
+      } else {
+        // Normal data_exchange / INIT / BACK – put your real logic here
+        responsePayload = {
+          screen: "SCREEN_NAME", // TODO replace with your real screen name
+          data: {
+            some_key: "some_value",
+          },
+        };
+      }
+
+      const encrypted = encryptResponse(
+        responsePayload,
+        aesKeyBuffer,
+        initialVectorBuffer
+      );
+
+      // Encrypted responses must be plain text (Base64 string)
+      return res.type("text/plain").send(encrypted);
     }
 
-    // Decrypt request
-    const { decryptedBody, aesKeyBuffer, initialVectorBuffer } = decryptRequest(
-      req.body,
-      PRIVATE_KEY
-    );
-
-    console.log("🧩 Decrypted Flow payload:", decryptedBody);
-
-    let responsePayload;
-
-    // Health check from Meta
-    if (decryptedBody.action === "ping") {
-      responsePayload = {
-        data: {
-          status: "active",
-        },
-      };
-    } else {
-      // Normal data_exchange / INIT / BACK
-      responsePayload = {
-        screen: "SCREEN_NAME", // TODO: replace with your real screen name
-        data: {
-          some_key: "some_value",
-        },
-      };
-    }
-
-    // Encrypt response and send as Base64 plain text
-    const encrypted = encryptResponse(
-      responsePayload,
-      aesKeyBuffer,
-      initialVectorBuffer
-    );
-    res.type("text/plain").send(encrypted);
+    // 3b) No encrypted fields – probably Meta’s health check or a simple probe.
+    // Just answer with 200 + a simple JSON body.
+    console.log("✅ /data received non-encrypted health-check request");
+    return res.status(200).json({
+      data: {
+        status: "active",
+      },
+    });
   } catch (err) {
     console.error("❌ Error in /data:", err);
-    // 421 tells the client to re-download the public key and retry
-    res.sendStatus(421);
+    // Do NOT send 4xx/5xx for health check – always 200
+    return res.status(200).type("text/plain").send("");
   }
 });
 
